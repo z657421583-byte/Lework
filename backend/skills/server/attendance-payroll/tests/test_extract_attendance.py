@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from extract_attendance import prepare_pages
+from extract_attendance import json_path_for_page_image, prepare_pages
 
 
 class ExtractAttendanceTest(unittest.TestCase):
@@ -20,6 +20,13 @@ class ExtractAttendanceTest(unittest.TestCase):
             self.assertEqual(Path(pages[0]).read_bytes(), source.read_bytes())
             payload = json.dumps({"pages": pages})
             self.assertIn("doc-1.png", payload)
+
+    def test_json_path_sits_beside_rendered_png(self):
+        png = Path("/tmp/.attendance-pages/doc-1/page-15-part-1.png")
+        self.assertEqual(
+            json_path_for_page_image(str(png)),
+            str(png.with_name("page-15.json")),
+        )
 
 
 if __name__ == "__main__":
