@@ -20,8 +20,10 @@ from scripts.payroll_calculator import (
     month_statutory_holidays,
     note_skipped_generated_history,
     parse_construction_formula,
+    parse_performance_standard,
     read_rows,
     source_hints,
+    fuzzy_match_review_note,
     write_workbook,
 )
 
@@ -342,7 +344,41 @@ class PayrollCalculatorTest(unittest.TestCase):
             item["说明"] for item in rows["review_exceptions"]
             if item["姓名"] == "周翌" and "模糊匹配" in item["说明"]
         ]
-        self.assertEqual(notes, ["姓名单字 OCR 易混，已模糊匹配，需人工复核"])
+        self.assertEqual(notes, ["姓名单字 OCR 易混，已模糊匹配，需人工复核是否同一人"])
+
+    def test_unique_near_name_still_calculates_and_asks_review(self):
+        rows = calculate(
+            [{"name": "苏亚南", "category": "人事代理", "_source_file": "人员花名册.xlsx", "_row": 55}],
+            [{"name": "苏亚南", "category": "人事代理", "position_salary": 3000, "performance": 1000,
+              "_source_file": "2026年6月份人事代理.xlsx", "_row": 55}],
+            [{"name": "苏亚楠", "actual_work_days": 21}],
+            "2026-06", None, None,
+        )
+        self.assertEqual(len(rows["payroll_detail"]), 1)
+        self.assertEqual(rows["payroll_detail"][0]["岗位工资"], 3000)
+        notes = "；".join(item["说明"] for item in rows["review_exceptions"])
+        self.assertIn("模糊匹配", notes)
+        self.assertNotIn("未计算", notes)
+        self.assertNotIn("歧义", notes)
+        self.assertNotIn("姓名姓名", notes)
+
+    def test_fuzzy_review_note_does_not_repeat_name_prefix(self):
+        self.assertEqual(
+            fuzzy_match_review_note("编辑相似度 80%"),
+            "姓名编辑相似度 80%，已模糊匹配，需人工复核是否同一人",
+        )
+        self.assertNotIn("姓名姓名", fuzzy_match_review_note("姓名编辑相似度 80%"))
+
+    def test_other_month_history_workdays_are_not_compared(self):
+        rows = calculate(
+            [],
+            [{"name": "甲", "category": "外聘", "position_salary": 3000, "performance": 1000,
+              "work_days": 21, "_source_month": "2026-05"}],
+            [{"name": "甲", "category": "外聘", "actual_work_days": 26}],
+            "2026-06", None, None,
+        )
+        notes = "；".join(item["说明"] for item in rows["review_exceptions"] if item.get("姓名") == "甲")
+        self.assertNotIn("工作天数", notes)
 
     def test_roster_does_not_override_attendance_project(self):
         rows = calculate(
@@ -478,13 +514,14 @@ class PayrollCalculatorTest(unittest.TestCase):
     def test_fuzzy_name_candidate_is_not_used_when_tied(self):
         rows = calculate(
             [
-                {"name": "张小明", "project": "B项目", "category": "外包", "status": "正常"},
-                {"name": "张晓明", "project": "B项目", "category": "外包", "status": "正常"},
+                {"name": "王志刚", "project": "B项目", "category": "外包", "status": "正常"},
+                {"name": "王志钢", "project": "B项目", "category": "外包", "status": "正常"},
             ],
-            [], [{"name": "张小鸣", "project": "B项目", "category": "外包", "actual_work_days": 21}],
+            [], [{"name": "王志强", "project": "B项目", "category": "外包", "actual_work_days": 21}],
             "2026-06", None, None,
         )
         self.assertTrue(any("模糊匹配存在歧义" in item["说明"] for item in rows["review_exceptions"]))
+        self.assertEqual(rows["payroll_detail"], [])
 
     def test_quarter_phone_is_not_paid_twice_when_already_paid(self):
         history = [
@@ -719,7 +756,7 @@ class PayrollCalculatorTest(unittest.TestCase):
         remainder = calculate(
             [], history,
             [{"name": "周七", "project": "C项目", "category": "外包",
-              "actual_work_days": 26, "personal_leave_days": 4}],
+              "actual_work_days": 26, "leave_days": 4}],
             "2026-06", None, None,
         )
         self.assertEqual(remainder["payroll_detail"][0]["事假天数"], 0)
@@ -747,6 +784,20 @@ class PayrollCalculatorTest(unittest.TestCase):
         )
         self.assertEqual(marked["payroll_detail"][0]["事假天数"], 2)
         self.assertEqual(marked["payroll_detail"][0]["绩效工资"], 4200 - 4200 / 21.75 * 2)
+
+    def test_consecutive_personal_leave_is_kept_even_if_plus_attendance_fills_month(self):
+        rows = calculate(
+            [],
+            [{"name": "王自鑫", "position_salary": 2100, "performance": 2700}],
+            [{"name": "王自鑫", "actual_work_days": 17, "marked_work_days": 17,
+              "personal_leave_days": 13, "note": "事假"}],
+            "2026-06", None, None,
+        )
+        self.assertEqual(rows["payroll_detail"][0]["事假天数"], 13)
+        self.assertAlmostEqual(
+            rows["payroll_detail"][0]["绩效工资"],
+            2700 - 2700 / 21.75 * 13,
+        )
 
     def test_printed_attendance_must_equal_mark_count(self):
         history = [{"name": "对账", "project": "C项目", "category": "外包",
@@ -861,6 +912,31 @@ class PayrollCalculatorTest(unittest.TestCase):
         self.assertEqual(parse_construction_formula("=D11*30"), [(None, 30.0)])
         self.assertEqual(parse_construction_formula("=15*30+11*50"), [(15.0, 30.0), (11.0, 50.0)])
 
+    def test_performance_formula_uses_standard_not_prorated_amount(self):
+        self.assertEqual(parse_performance_standard("=ROUND(2700/21.75*17,2)"), 2700)
+        self.assertEqual(parse_performance_standard("=2700-2700/21.75*5"), 2700)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(["姓名", "工作天数", "基本工资", "绩效工资"])
+            sheet.append(["王自鑫", 17, 2100, "=ROUND(2700/21.75*17,2)"])
+            workbook.save(path)
+            loaded = read_rows(path)
+            self.assertEqual(loaded[0]["performance"], 2700)
+            rows = calculate(
+                [], loaded,
+                [{"name": "王自鑫", "actual_work_days": 17, "personal_leave_days": 5,
+                  "daily_marks": {str(day): "事" for day in range(1, 6)} | {str(day): "8" for day in range(6, 23)}}],
+                "2026-06", None, None,
+            )
+            self.assertEqual(rows["baseline"][0]["绩效工资"], 2700)
+            self.assertEqual(rows["payroll_detail"][0]["事假天数"], 5)
+            self.assertAlmostEqual(
+                rows["payroll_detail"][0]["绩效工资"],
+                2700 - 2700 / 21.75 * 5,
+            )
+
     def test_segmented_construction_subsidy_from_formula_and_attendance(self):
         rows = calculate(
             [],
@@ -907,6 +983,45 @@ class PayrollCalculatorTest(unittest.TestCase):
         )
         self.assertEqual(rows["payroll_detail"][0]["岗位工资"], 5000)
         self.assertEqual(rows["payroll_detail"][0]["项目"], "")
+
+    def test_page_department_containing_job_title_stays_a_project(self):
+        yangling = "杨凌职业技术学院新校区项目经理部"
+        rows = calculate(
+            [],
+            [{"name": "付浩", "project": "宇航钛合金智能锻造项目", "category": "外聘",
+              "position_salary": 3000, "performance": 1000}],
+            [{"name": "付浩", "category": "外聘", "actual_work_days": 26,
+              "page_project": yangling}],
+            "2026-06", None, None,
+            attendance_project="宇航级钛及钛合金智能锻造产线及供应链协同建设项目",
+        )
+        self.assertEqual(rows["payroll_detail"][0]["项目"], yangling)
+
+    def test_mixed_attendance_files_do_not_share_first_page_project(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / "page-1.json"
+            second = Path(directory) / "page-10.json"
+            first.write_text(json.dumps({
+                "month": "2026-06",
+                "project": "宇航级钛及钛合金智能锻造产线及供应链协同建设项目",
+                "records": [{"name": "樊云刚", "actual_work_days": 21}],
+            }), encoding="utf-8")
+            second.write_text(json.dumps({
+                "month": "2026-06",
+                "project": "杨凌职业技术学院新校区项目经理部",
+                "records": [{"name": "付浩", "actual_work_days": 26}],
+            }), encoding="utf-8")
+            _month, shared, records = attendance_records_from_paths([first, second])
+            self.assertIsNone(shared)
+            rows = calculate(
+                [],
+                [{"name": "樊云刚", "position_salary": 3000, "performance": 1000},
+                 {"name": "付浩", "position_salary": 3000, "performance": 1000}],
+                records, "2026-06", None, None, None, shared,
+            )
+            details = {row["姓名"]: row["项目"] for row in rows["payroll_detail"]}
+            self.assertIn("宇航", details["樊云刚"])
+            self.assertIn("杨凌", details["付浩"])
 
     def test_yitong_and_yitong_homophone_are_distinct_vendors(self):
         rows = calculate(

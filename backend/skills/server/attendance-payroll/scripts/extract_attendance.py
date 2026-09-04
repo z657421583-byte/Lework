@@ -48,7 +48,14 @@ def prepare_pages(sources: list[Path], output_dir: Path) -> list[str]:
             continue
         if suffix in IMAGE_SUFFIXES:
             target = output_dir / f"doc-{index}{suffix}"
-            shutil.copy2(source, target)
+            try:
+                from PIL import Image
+                from pdf_prepare import deskew_image
+
+                with Image.open(source) as image:
+                    deskew_image(image).save(target)
+            except Exception:
+                shutil.copy2(source, target)
             pages.append(str(target))
             continue
         fail(ERROR_INPUT, f"unsupported attendance file type: {suffix or source.name}")

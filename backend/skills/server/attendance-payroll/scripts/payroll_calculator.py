@@ -148,13 +148,21 @@ def is_unknown_name(value: Any) -> bool:
     return clean(value) in {"未知", "未知人员", "无法识别", "不详", "无名"}
 
 
+JOB_TITLES = {
+    "项目经理", "项目副经理", "技术负责人", "施工员", "技术员", "质量员",
+    "资料员", "安全员", "预算员", "商务经理", "后勤", "试验", "电工",
+    "司机", "厨师", "保洁", "生产经理", "现场经理", "装修主管", "安全主管",
+}
+
+
 def is_job_title(value: Any) -> bool:
+    """岗位名须整段匹配。项目名里的「项目经理部」不能当成岗位。"""
     text = clean(value)
-    return any(token in text for token in (
-        "项目经理", "项目副经理", "技术负责人", "施工员", "技术员", "质量员",
-        "资料员", "安全员", "预算员", "商务经理", "后勤", "试验", "电工",
-        "司机", "厨师", "保洁",
-    ))
+    if not text:
+        return False
+    if text in JOB_TITLES:
+        return True
+    return any(text.endswith(title) and len(text) <= len(title) + 4 for title in JOB_TITLES)
 
 
 def is_employment_category(value: str) -> bool:
@@ -243,6 +251,23 @@ def looks_like_project_label(value: Any) -> bool:
     if is_job_title(text) or is_employment_category(text):
         return False
     return True
+
+
+def parse_performance_standard(formula: Any) -> float | None:
+    """绩效单元格常是 ROUND(标准/21.75*出勤,2) 或 标准-标准/21.75*事假。返回标准，不用折算后的值。"""
+    text = str(formula or "").strip()
+    if not text.startswith("=") or "21.75" not in text.replace(" ", ""):
+        return None
+    expr = re.sub(r"\s+", "", text[1:]).upper()
+    numbers = [float(token) for token in re.findall(r"\d+(?:\.\d+)?", expr)]
+    standards = [
+        value for value in numbers
+        if value > 31 and not math.isclose(value, 21.75, abs_tol=1e-6)
+    ]
+    unique = {round(value, 4) for value in standards}
+    if len(unique) == 1:
+        return next(iter(unique))
+    return None
 
 
 def parse_construction_formula(formula: Any) -> list[tuple[float | None, float]]:
@@ -527,6 +552,14 @@ def read_rows(path: Path) -> list[dict[str, Any]]:
                     original = sheet.cell(row_number, construction_index + 1).value
                     if isinstance(original, str) and original.startswith("="):
                         row["_construction_formula"] = original
+                performance_index = mapping.get("performance")
+                if performance_index is not None:
+                    original = sheet.cell(row_number, performance_index + 1).value
+                    if isinstance(original, str) and original.startswith("="):
+                        row["_performance_formula"] = original
+                        standard = parse_performance_standard(original)
+                        if standard is not None:
+                            row["performance"] = standard
                 if not is_summary(row) and not is_unknown_name(row.get("name")):
                     sheet_rows.append(row)
             assign_yellow_block_projects(sheet, sheet_rows)
@@ -600,8 +633,15 @@ def fuzzy_name_score(observed: Any, candidate: Any) -> tuple[float, str]:
         if len(left) >= 3 and len(differences) == 1:
             return 0.85, "单字姓名近似"
     if ratio >= 0.8:
-        return ratio, f"姓名编辑相似度 {ratio:.0%}"
+        return ratio, f"编辑相似度 {ratio:.0%}"
     return ratio, ""
+
+
+def fuzzy_match_review_note(reason: str) -> str:
+    text = (reason or "").strip()
+    if text.startswith("姓名"):
+        return f"{text}，已模糊匹配，需人工复核是否同一人"
+    return f"姓名{text}，已模糊匹配，需人工复核是否同一人"
 
 
 def fuzzy_candidates(
@@ -627,12 +667,14 @@ def uniquely_fuzzy_matched(
     candidates: list[dict[str, Any]],
     required_identity: tuple[str, str, str] | None = None,
 ) -> tuple[dict[str, Any] | None, str | None, str | None]:
-    """Accept a fuzzy candidate only with a high score and clear lead."""
+    """唯一模糊候选仍采用并复核；只有多个同分/接近候选才算歧义并跳过。"""
     ranked = fuzzy_candidates(observed, candidates, required_identity)
     if not ranked:
         return None, None, None
     score, reason, winner = ranked[0]
-    next_score = ranked[1][0] if len(ranked) > 1 else 0
+    if len(ranked) == 1:
+        return winner, reason, None
+    next_score = ranked[1][0]
     if score >= 0.9 and score - next_score >= 0.08:
         return winner, reason, None
     choices = "、".join(
@@ -674,18 +716,19 @@ def attendance_records_from_paths(
 ) -> tuple[str | None, str | None, list[dict[str, Any]]]:
     """Load one or more attendance JSON files and reject conflicting months."""
     months: set[str] = set()
-    project: str | None = None
+    projects: set[str] = set()
     records: list[dict[str, Any]] = []
     for path in paths:
         month, source_project, source_records = attendance_records(path)
         if month:
             months.add(month)
-        if source_project and not project:
-            project = source_project
+        if source_project:
+            projects.add(source_project)
         records.extend(source_records)
     if len(months) > 1:
         raise ValueError("考勤月份冲突：" + "、".join(sorted(months)))
-    return next(iter(months), None), project, records
+    shared_project = next(iter(projects), None) if len(projects) == 1 else None
+    return next(iter(months), None), shared_project, records
 
 
 def attendance_mark_values(record: dict[str, Any]) -> list[str]:
@@ -756,18 +799,18 @@ def attendance_days(record: dict[str, Any], month: str | None = None) -> tuple[f
         actual = float(sum(1 for mark in marks if is_attendance_mark(mark)))
         if not marks:
             actual = None
-    # 事假只认格子里的「事/事假」。休、换、调、周末缺口和加班日都不是事假；
-    # 也不能把 leave_days 或「整月天数−出勤」当成事假来扣绩效。
+    # 有格子时只数「事/事假」，忽略 JSON 里误填的 personal_leave_days。
+    # 无格子时采用 personal_leave_days；leave_days 不是事假。
+    # 不得因出勤+事假=当月日历天数而清零（连续事假如 17+13=30）。
     if marks:
         return actual, float(sum(1 for mark in marks if is_personal_leave_mark(mark)))
-    leave = number(record.get(
+    explicit = number(record.get(
         "personal_leave_days",
         record.get("personal_leave", record.get("事假天数")),
-    )) or 0
-    days = month_length(month)
-    if leave and actual is not None and days is not None and math.isclose(actual + leave, days, abs_tol=1e-6):
-        return actual, 0
-    return actual, leave
+    ))
+    if explicit:
+        return actual, float(explicit)
+    return actual, 0
 
 
 def has_attendance_evidence(record: dict[str, Any]) -> bool:
@@ -1132,6 +1175,9 @@ def display_project(segments: list[dict[str, Any]], history_row: dict[str, Any])
     )
     if ranked:
         return ranked[0]["project"]
+    for segment in segments:
+        if segment.get("project"):
+            return segment["project"]
     return content_project(history_row)
 
 
@@ -1266,7 +1312,7 @@ def choose_history_baseline(
             row for row in historical_rows
             if identity_matches(row_identity(fuzzy), row_identity(row))
         ]
-        issues.append(f"姓名{reason}，已模糊匹配，需人工复核")
+        issues.append(fuzzy_match_review_note(reason))
     same_month = [row for row in matches if row.get("_source_month") == month]
     candidates = same_month or matches
     dated = [row for row in candidates if row.get("_source_month")]
@@ -1343,7 +1389,7 @@ def calculate(
                     observed=record, candidates=list(roster.values()),
                 )
                 if roster_row is not None:
-                    issues.append(f"姓名{reason}，已模糊匹配，需人工复核")
+                    issues.append(fuzzy_match_review_note(reason))
                 elif ambiguity:
                     issues.append(ambiguity)
                 roster_row = roster_row or {}
@@ -1388,7 +1434,7 @@ def calculate(
             and not math.isclose(actual, hist_days, abs_tol=1e-6)
         ):
             issues.append(
-                f"当月考勤实际出勤{actual:g}与历史工资工作天数{hist_days:g}不一致"
+                f"同月历史工资表工作天数为{hist_days:g}，与考勤实际出勤{actual:g}不一致，请核对本月工资表与考勤"
             )
         personal_leave = 0.0
         sick = 0.0
